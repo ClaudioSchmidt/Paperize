@@ -333,6 +333,35 @@ class PaperizeLiveWallpaperService : GLWallpaperService(), LifecycleOwner {
             renderer.setNormalOffsetX(xOffset)
         }
 
+        override fun onSurfaceSizeChanged(newWidth: Int, newHeight: Int) {
+            // If surface grows (e.g. unfolding), try to force a reload and
+            // recenter parallax so the wallpaper updates immediately.
+            Log.d(TAG, "Surface size changed callback received: ${newWidth}x${newHeight}")
+            try {
+                // Re-center parallax offset so wallpaper is centered on larger surface
+                try {
+                    renderer.setNormalOffsetX(0.5f)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to recenter renderer offset", e)
+                }
+
+                // Force reload bypasses visibility checks and skips crossfade
+                // where appropriate so the new higher-res wallpaper is uploaded
+                // immediately even if the launcher hasn't sent offset updates.
+                try {
+                    renderController.forceReloadCurrentArtwork()
+                } catch (e: Exception) {
+                    Log.w(TAG, "forceReload failed, falling back to immediate reload", e)
+                    renderController.reloadCurrentArtwork(com.anthonyla.paperize.service.livewallpaper.renderer.ReloadImmediate)
+                }
+
+                // Ensure GL thread renders a frame
+                requestRender()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error triggering reload after surface size change", e)
+            }
+        }
+
         override fun onTouchEvent(event: MotionEvent) {
             try {
                 gestureDetector.onTouchEvent(event)

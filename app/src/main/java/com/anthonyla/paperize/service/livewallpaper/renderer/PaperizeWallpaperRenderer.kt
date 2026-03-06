@@ -4,6 +4,8 @@ import com.anthonyla.paperize.core.ScalingType
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.util.Log
@@ -48,6 +50,12 @@ class PaperizeWallpaperRenderer(
     interface Callbacks {
         fun queueEventOnGlThread(event: () -> Unit)
         fun requestRender()
+        /**
+         * Notifies the owning engine that the surface size changed and the
+         * current uploaded picture may be too small. The engine can decide
+         * to reload the wallpaper at the new resolution.
+         */
+        fun onSurfaceSizeChanged(newWidth: Int, newHeight: Int)
     }
 
     // Surface dimensions
@@ -130,6 +138,15 @@ class PaperizeWallpaperRenderer(
     private val loadingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var currentLoadJob: Job? = null
 
+    // Handler for posting to GL thread
+    private val glHandler = Handler(Looper.getMainLooper())
+
+    // Pending runnable for surface change render request (debounced)
+    private var pendingSurfaceRenderRunnable: Runnable? = null
+
+    // Debounce time for surface change render (to avoid transient frame jumps)
+    private val SURFACE_CHANGE_DEBOUNCE_MS = 16 // ~60fps
+
     override fun onSurfaceCreated(gl: GL10, config: EGLConfig) {
         Log.d(TAG, "onSurfaceCreated")
 
@@ -156,6 +173,9 @@ class PaperizeWallpaperRenderer(
     override fun onSurfaceChanged(gl: GL10, width: Int, height: Int) {
         Log.d(TAG, "onSurfaceChanged: ${width}x${height}")
 
+        val oldW = surfaceWidth
+        val oldH = surfaceHeight
+
         surfaceWidth = width
         surfaceHeight = height
 
@@ -163,6 +183,34 @@ class PaperizeWallpaperRenderer(
 
         // Recreate framebuffers for blur at new resolution
         createBlurFramebuffers(width, height)
+
+        // If we already have an uploaded picture that is smaller than the
+        // new surface, request the engine to reload a higher-resolution
+        // wallpaper.
+        currentPicture?.let { pic ->
+            if (pic.width < width || pic.height < height) {
+                Log.d(TAG, "Uploaded picture (${pic.width}x${pic.height}) is smaller than surface (${width}x${height}), requesting reload")
+                callbacks.onSurfaceSizeChanged(width, height)
+            }
+        }
+
+        // If the surface grew (e.g. unfolding) after we already uploaded
+        // a picture, recentre parallax and schedule a debounced render so the
+        // already-uploaded texture is drawn with the new viewport and
+        // centered offset.
+        if (oldW > 0 && (width > oldW || height > oldH)) {
+            Log.d(TAG, "Surface grew from ${oldW}x${oldH} to ${width}x${height}, recentring and requesting render")
+            try {
+                setNormalOffsetX(0.5f)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to recenter normal offset on surface change", e)
+            }
+
+            // Debounce render to avoid transient frame jumps while compositor settles.
+            pendingSurfaceRenderRunnable?.let { glHandler.removeCallbacks(it) }
+            pendingSurfaceRenderRunnable = Runnable { callbacks.requestRender() }
+            glHandler.postDelayed(pendingSurfaceRenderRunnable!!, SURFACE_CHANGE_DEBOUNCE_MS.toLong())
+        }
     }
 
     override fun onDrawFrame(gl: GL10) {
@@ -380,7 +428,7 @@ class PaperizeWallpaperRenderer(
             val currentWidth = imageWidth * effectiveScaleX
             // Target at least 20% overscan at max intensity
             val minExtraWidth = viewWidth * parallaxIntensity * 0.2f
-            
+
             if ((currentWidth - viewWidth) < minExtraWidth) {
                 // Zoom in to create scrollable area
                 val targetWidth = viewWidth + minExtraWidth
@@ -399,13 +447,16 @@ class PaperizeWallpaperRenderer(
         // 2. Calculate parallax offset
         // Available scroll range is the difference between scaled image width and screen width
         val extraWidth = kotlin.math.max(0f, scaledWidth - viewWidth)
-        
-        // Calculate offset based on scroll position (0.0 = left, 1.0 = right)
-        // Center (0.5) is 0 offset
-        // Reverting to: `maxParallaxOffset = extraWidth`.
-        // And relying on the "Zoom" logic to create that width if needed.
-        val maxParallaxOffset = extraWidth
-        val parallaxOffset = maxParallaxOffset * (0.5f - normalOffsetX)
+
+        // If parallax is disabled we center the image horizontally regardless
+        val maxParallaxOffset = if (parallaxEnabled) extraWidth else 0f
+        val parallaxOffset = if (parallaxEnabled) {
+            // Calculate offset based on scroll position (0.0 = left, 1.0 = right)
+            // Center (0.5) is 0 offset
+            maxParallaxOffset * (0.5f - normalOffsetX)
+        } else {
+            0f
+        }
         
         // Verbose logging removed to avoid per-frame log spam
 
